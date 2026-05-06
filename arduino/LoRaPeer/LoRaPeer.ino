@@ -4,21 +4,24 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// -------------------- PINOUT (según indicaciones)
+// -------------------- PINOUT
 const int LORA_MISO = 19;
-const int LORA_SS   = 18; // CS
+const int LORA_SS   = 18;
 const int LORA_SCK  = 5;
 const int LORA_MOSI = 27;
 const int LORA_RST  = 14;
-const int LORA_IRQ  = 26; // DIO0
+const int LORA_IRQ  = 26;
 
 const int OLED_SCL = 15;
 const int OLED_SDA = 4;
 const int OLED_RST = 16;
 
-// -------------------- LoRa / display config
-const long LORA_FREQ = 915E6; // ajustar a 868E6 o 433E6 según tu región
+const long LORA_FREQ = 915E6;
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -26,24 +29,34 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
 Preferences prefs;
 
+// -------------------- BLE UUIDs
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_RX_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_TX_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// -------------------- ESTADO GLOBAL
 bool displayReady = false;
 uint8_t NODE_ID = 0;
 uint8_t PEER_ID = 0;
 
-// Estructura para mensajes con timestamp
+int BLE_clients_connected = 0;
+BLEServer* pServer = NULL;
+BLECharacteristic* pTxCharacteristic = NULL;
+
+// Estructura para mensajes
 struct Message {
   uint8_t from;
   String text;
   unsigned long timestamp;
   int rssi;
+  bool isBLE;
 };
 
-// Buffer de conversación (últimos 10 mensajes)
 const int MSG_BUFFER_SIZE = 10;
 Message msgBuffer[MSG_BUFFER_SIZE];
 int msgBufferIdx = 0;
 
-// Para medir latencia
+// Latencia
 unsigned long lastMsgSentTime = 0;
 String lastMsgSent = "";
 unsigned long lastAckReceivedTime = 0;
@@ -52,14 +65,57 @@ bool waitingForAck = false;
 unsigned long lastHeartbeatTime = 0;
 const unsigned long HEARTBEAT_MS = 5000;
 
+// ==================== FORWARD DECLARATIONS ====================
+void displayStatus();
+void displayMessage(const String &t);
+void sendMessage(uint8_t to, uint8_t from, uint8_t type, const String &msg);
+void sendAck(uint8_t to, uint8_t from);
+void addMessageToBuffer(uint8_t msgFrom, const String &text, unsigned long ts, int rssi, bool isBLE);
+
+// ==================== BLE CALLBACKS ====================
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    BLE_clients_connected++;
+    Serial.print("BLE: Cliente conectado. Total: "); Serial.println(BLE_clients_connected);
+    displayStatus();
+  };
+
+  void onDisconnect(BLEServer* pServer) {
+    if (BLE_clients_connected > 0) BLE_clients_connected--;
+    Serial.print("BLE: Cliente desconectado. Total: "); Serial.println(BLE_clients_connected);
+    displayStatus();
+  }
+};
+
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    String rxValue = pCharacteristic->getValue().c_str();
+    if (rxValue.length() > 0) {
+      String msg = rxValue;
+      msg.trim();
+      if (msg.length() > 0) {
+        Serial.print("BLE RX: "); Serial.println(msg);
+        
+        // Enviar por LoRa al peer
+        sendMessage(PEER_ID, NODE_ID, 0, msg);
+        lastMsgSent = msg;
+        lastMsgSentTime = millis();
+        waitingForAck = true;
+        addMessageToBuffer(NODE_ID, msg, millis(), 0, true);
+        displayStatus();
+      }
+    }
+  }
+};
+
+// ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
   delay(100);
 
-  // I2C para OLED con los pines proporcionados
+  // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 allocation failed");
     displayReady = false;
   } else {
     displayReady = true;
@@ -68,25 +124,23 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // SPI custom pins para SX1276/78
+  // LoRa
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_IRQ);
   if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println("LoRa init failed. Check wiring and frequency.");
-    displayMessage("LoRa init FAILED");
+    Serial.println("LoRa init failed.");
+    displayMessage("LoRa FAILED");
     while (1) { delay(2000); }
   }
 
-  // Preferences (NVS) para guardar IDs y evitar reconfigurar cada vez
+  // Auto-discovery LoRa
   prefs.begin("lora", false);
   uint8_t storedNode = prefs.getUChar("node_id", 0);
   uint8_t storedPeer = prefs.getUChar("peer_id", 0);
 
   displayMessage("Auto-detecting...");
-  Serial.println("--- LoRaPeer starting ---");
-  Serial.println("Escuchando red LoRa por 5s para auto-configurarse...");
+  Serial.println("--- P2P LoRa + BLE starting ---");
 
-  // Auto-discovery: escuchar paquetes en los próximos 5 segundos
   unsigned long start = millis();
   bool discoveredPeer = false;
   uint8_t detectedPeerID = 0;
@@ -95,9 +149,7 @@ void setup() {
     if (Serial.available()) {
       String s = Serial.readStringUntil('\n');
       s.trim();
-      if (s.length()) {
-        Serial.println("Entrada por Serial detectada: " + s);
-        // Formato esperado: node=<n> peer=<m>
+      if (s.length() && s.indexOf("node=") >= 0) {
         int nIndex = s.indexOf("node=");
         int pIndex = s.indexOf("peer=");
         if (nIndex >= 0) {
@@ -110,23 +162,20 @@ void setup() {
           if (pval.indexOf(' ')>0) pval = pval.substring(0, pval.indexOf(' '));
           PEER_ID = (uint8_t) pval.toInt();
         }
-        Serial.println("IDs configurados manualmente.");
         prefs.putUChar("node_id", NODE_ID);
         prefs.putUChar("peer_id", PEER_ID);
-        return; // salir del setup después de configurar
+        goto ble_init;
       }
     }
     
-    // Escuchar paquetes LoRa para auto-detección
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
       uint8_t to = LoRa.read();
       uint8_t from = LoRa.read();
-      LoRa.read(); // seq
+      LoRa.read();
       String payload = "";
       while (LoRa.available()) payload += (char)LoRa.read();
       
-      Serial.print("Detectado paquete de node "); Serial.println(from);
       detectedPeerID = from;
       discoveredPeer = true;
       break;
@@ -134,42 +183,79 @@ void setup() {
     delay(50);
   }
 
-  // Si detectó un peer, usar el ID opuesto
   if (discoveredPeer) {
     PEER_ID = detectedPeerID;
     NODE_ID = (PEER_ID == 1) ? 2 : 1;
-    Serial.print("Auto-configured: NODE_ID="); Serial.print(NODE_ID);
-    Serial.print(" PEER_ID="); Serial.println(PEER_ID);
   } else if (storedNode != 0 && storedPeer != 0) {
-    // Usar valores guardados si los hay
     NODE_ID = storedNode;
     PEER_ID = storedPeer;
-    Serial.print("Usando IDs guardados: NODE_ID="); Serial.print(NODE_ID);
-    Serial.print(" PEER_ID="); Serial.println(PEER_ID);
   } else {
-    // Defaults: esta es probablemente la primera placa
     NODE_ID = 1;
     PEER_ID = 2;
-    Serial.println("Usando IDs por defecto: NODE_ID=1 PEER_ID=2");
   }
 
-  // Guardar
   prefs.putUChar("node_id", NODE_ID);
   prefs.putUChar("peer_id", PEER_ID);
 
   Serial.print("Node ID: "); Serial.println(NODE_ID);
   Serial.print("Peer ID: "); Serial.println(PEER_ID);
-  Serial.println("Comandos: 'msg: tu mensaje aqui' para enviar");
+
+ble_init:
+  // ==================== INICIALIZAR BLE ====================
+  String deviceName = "LoRA_N" + String(NODE_ID);
+  BLEDevice::init(deviceName.c_str());
+  
+  // Configurar poder y MTU
+  BLEDevice::setPower(ESP_PWR_LVL_P7);
+  
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // Característica TX (notificaciones al teléfono)
+  pTxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_TX_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pTxCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  // Característica RX (recibir del teléfono)
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_RX_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  pRxCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE);
+  pRxCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+
+  pService->start();
+
+  // Configurar advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMaxPreferred(0x12);
+  
+  BLEDevice::startAdvertising();
+
+  // Configurar MTU
+  BLEDevice::setMTU(185);
+
+  Serial.print("BLE initialized: "); Serial.println(deviceName);
+  Serial.println("Waiting for BLE connections...");
   displayStatus();
 }
 
+// ==================== LOOP ====================
 void loop() {
-  // Recibir paquetes
+  // Recibir LoRa
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
     uint8_t to = LoRa.read();
     uint8_t from = LoRa.read();
-    uint8_t type = LoRa.read(); // tipo: 0=msg, 1=ACK
+    uint8_t type = LoRa.read();
     String payload = "";
     while (LoRa.available()) payload += (char)LoRa.read();
     
@@ -178,28 +264,34 @@ void loop() {
 
     if (to == NODE_ID) {
       if (type == 1) {
-        // ACK recibido
+        // ACK
         lastAckReceivedTime = rxTime;
         unsigned long latency = rxTime - lastMsgSentTime;
-        Serial.print("ACK recibido en: "); Serial.print(latency); Serial.println("ms");
+        Serial.print("ACK in: "); Serial.print(latency); Serial.println("ms");
         waitingForAck = false;
       } else {
         // Mensaje de datos
-        Serial.print("RX from "); Serial.print(from);
-        Serial.print(" -> "); Serial.print(payload);
-        Serial.print(" [rssi="); Serial.print(rssi); Serial.println("]");
+        Serial.print("RX LoRa from "); Serial.print(from);
+        Serial.print(": "); Serial.println(payload);
         
-        // Guardar en buffer y mostrar en OLED
-        addMessageToBuffer(from, payload, rxTime, rssi);
+        addMessageToBuffer(from, payload, rxTime, rssi, false);
         
-        // Enviar ACK
+        // Enviar por BLE a todos los clientes conectados
+        if (BLE_clients_connected > 0 && pTxCharacteristic != NULL) {
+          String bleTx = String(from) + ": " + payload;
+          pTxCharacteristic->setValue((uint8_t *)bleTx.c_str(), bleTx.length());
+          pTxCharacteristic->notify();
+          Serial.print("BLE TX notify: "); Serial.println(bleTx);
+        }
+        
+        // Responder ACK por LoRa
         sendAck(from, NODE_ID);
       }
       displayStatus();
     }
   }
 
-  // Envío periódico heartbeat (solo si no estamos esperando ACK)
+  // Heartbeat
   if (millis() - lastHeartbeatTime > HEARTBEAT_MS && !waitingForAck) {
     lastHeartbeatTime = millis();
     String hb = "HB";
@@ -209,34 +301,16 @@ void loop() {
     waitingForAck = true;
   }
 
-  // Leer comandos por Serial
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    
-    if (line.startsWith("msg:")) {
-      String msg = line.substring(4);
-      msg.trim();
-      if (msg.length() > 0) {
-        sendMessage(PEER_ID, NODE_ID, 0, msg);
-        lastMsgSent = msg;
-        lastMsgSentTime = millis();
-        waitingForAck = true;
-        addMessageToBuffer(NODE_ID, msg, millis(), 0);
-        Serial.print("Sent: "); Serial.println(msg);
-      }
-    }
-  }
-
   delay(10);
 }
 
+// ==================== FUNCIONES ====================
 void sendMessage(uint8_t to, uint8_t from, uint8_t type, const String &msg) {
   LoRa.beginPacket();
   LoRa.write(to);
   LoRa.write(from);
-  LoRa.write(type);  // 0=data, 1=ACK
-  LoRa.print(msg);
+  LoRa.write(type);
+  LoRa.print(msg.substring(0, 50));
   LoRa.endPacket();
 }
 
@@ -244,18 +318,19 @@ void sendAck(uint8_t to, uint8_t from) {
   sendMessage(to, from, 1, "ACK");
 }
 
-void addMessageToBuffer(uint8_t msgFrom, const String &text, unsigned long ts, int rssi) {
+void addMessageToBuffer(uint8_t msgFrom, const String &text, unsigned long ts, int rssi, bool isBLE) {
   msgBuffer[msgBufferIdx].from = msgFrom;
   msgBuffer[msgBufferIdx].text = text.substring(0, 20);
   msgBuffer[msgBufferIdx].timestamp = ts;
   msgBuffer[msgBufferIdx].rssi = rssi;
+  msgBuffer[msgBufferIdx].isBLE = isBLE;
   msgBufferIdx = (msgBufferIdx + 1) % MSG_BUFFER_SIZE;
 }
 
 void displayMessage(const String &t) {
   if (!displayReady) return;
   display.clearDisplay();
-  display.setCursor(0,0);
+  display.setCursor(0, 0);
   display.setTextSize(2);
   display.println(t);
   display.display();
@@ -267,17 +342,21 @@ void displayStatus() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   
-  // Header: Node info
+  // Header
   display.print("N"); display.print(NODE_ID);
-  display.print("/P"); display.print(PEER_ID);
+  display.print(" BLE:");
+  if (BLE_clients_connected > 0) {
+    display.print(BLE_clients_connected);
+  } else {
+    display.print("--");
+  }
   display.print(" ");
   if (waitingForAck) {
-    display.println("(waiting ACK)");
+    display.println("ACK..");
   } else {
-    display.println("(ready)");
+    display.println("ok");
   }
   
-  // Línea separadora
   display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
   
   // Mostrar últimos 4 mensajes
@@ -288,6 +367,11 @@ void displayStatus() {
     int idx = (startIdx + i) % MSG_BUFFER_SIZE;
     if (msgBuffer[idx].from != 0) {
       display.setCursor(0, line);
+      if (msgBuffer[idx].isBLE) {
+        display.print("B");
+      } else {
+        display.print("L");
+      }
       display.print((msgBuffer[idx].from == NODE_ID) ? ">" : "<");
       display.print(msgBuffer[idx].from);
       display.print(": ");
@@ -296,7 +380,6 @@ void displayStatus() {
     }
   }
   
-  // Footer: señal
   display.drawLine(0, 53, 128, 53, SSD1306_WHITE);
   display.setCursor(0, 55);
   display.print("RSSI: ");
