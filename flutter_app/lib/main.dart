@@ -5,6 +5,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import 'codec/secure_codec.dart';
+import 'codec/rsa_oaep.dart';
+import 'codec/demo_keys.dart';
 
 void main() {
   runApp(const MyApp());
@@ -131,12 +133,17 @@ class _HomePageState extends State<HomePage> {
 
   final TextEditingController messageController = TextEditingController();
 
-  // Funcionalidad nueva: descifrado/descompresion en la app.
-  final SecureCodec codec = SecureCodec();
+  // Funcionalidad nueva: descifrado (RSA-2048 OAEP) y descompresion en la app.
   bool secureMode = false;
-  // Clave privada de demostracion (igual que secrets.h del firmware).
-  int privD = 1778720129;
-  int privN = 3601800221;
+  // Clave privada en PEM (demo). En produccion se carga desde un secret store.
+  String privateKeyPem = DemoKeys.privateKeyPem;
+  late SecureCodec codec = _buildCodec();
+
+  SecureCodec _buildCodec() {
+    return SecureCodec(
+      rsa: RsaOaep.fromPem(privateKeyPem: privateKeyPem),
+    );
+  }
 
   static const String serviceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String rxUuid = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -254,8 +261,6 @@ class _HomePageState extends State<HomePage> {
     final decoded = codec.decode(
       value,
       secure: secureMode,
-      privD: privD,
-      privN: privN,
     );
     _setSession(session, () {
       session.messages.add(ChatMessage.incoming(
@@ -337,8 +342,7 @@ class _HomePageState extends State<HomePage> {
   void _bumpScanner() => _scannerNotifier.value++;
 
   void _openSettings() {
-    final dCtrl = TextEditingController(text: privD.toString());
-    final nCtrl = TextEditingController(text: privN.toString());
+    final keyCtrl = TextEditingController(text: privateKeyPem);
     showDialog<void>(
       context: context,
       builder: (ctx) {
@@ -346,31 +350,34 @@ class _HomePageState extends State<HomePage> {
         return StatefulBuilder(
           builder: (ctx, setLocal) => AlertDialog(
             title: const Text("Modo seguro"),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text("Descifrar y descomprimir"),
-                  subtitle: const Text(
-                    "Descifra mensajes RSA en hex y descomprime Huffman al recibir.",
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text("Descifrar y descomprimir"),
+                    subtitle: const Text(
+                      "Descifra mensajes RSA-2048 (OAEP) en base64 y descomprime "
+                      "Huffman al recibir.",
+                    ),
+                    value: localSecure,
+                    onChanged: (v) => setLocal(() => localSecure = v),
                   ),
-                  value: localSecure,
-                  onChanged: (v) => setLocal(() => localSecure = v),
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: dCtrl,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: "Clave privada d"),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: nCtrl,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: "Modulo n"),
-                ),
-              ],
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: keyCtrl,
+                    minLines: 3,
+                    maxLines: 6,
+                    style: const TextStyle(fontSize: 11, fontFamily: "monospace"),
+                    decoration: const InputDecoration(
+                      labelText: "Clave privada (PEM)",
+                      alignLabelWithHint: true,
+                    ),
+                  ),
+                ],
+              ),
             ),
             actions: [
               TextButton(
@@ -381,8 +388,8 @@ class _HomePageState extends State<HomePage> {
                 onPressed: () {
                   setState(() {
                     secureMode = localSecure;
-                    privD = int.tryParse(dCtrl.text) ?? privD;
-                    privN = int.tryParse(nCtrl.text) ?? privN;
+                    privateKeyPem = keyCtrl.text.trim();
+                    codec = _buildCodec();
                   });
                   Navigator.of(ctx).pop();
                 },

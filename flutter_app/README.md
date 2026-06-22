@@ -58,20 +58,24 @@ La app mantiene **varias conexiones BLE simultáneas**. Cada nodo tiene su propi
 hilo de mensajes y se elige el activo desde el selector superior. El panel de
 estado muestra cuántos dispositivos hay conectados.
 
-## Modo seguro (Huffman + RSA)
+## Modo seguro (RSA-2048 + Huffman)
 
-Acopla la funcionalidad nueva del firmware en la recepción. Desde el ícono de
-candado en la barra superior se activa el "modo seguro" y se configura la clave
-privada `(d, n)`. Al recibir un mensaje, la app:
+Acopla la funcionalidad del firmware en la recepción. Desde el ícono de candado
+en la barra superior se activa el "modo seguro" y se pega la **clave privada en
+formato PEM**. Al recibir un mensaje, la app:
 
-1. Si el payload viene en hexadecimal, lo **descifra** con RSA (solo con la
-   clave privada correcta).
+1. Si el payload viene en base64, lo **descifra** con **RSA-2048 OAEP (SHA-256)**
+   usando la clave privada (pointycastle). Solo la clave correcta descifra.
 2. Si el resultado es un buffer **Huffman**, lo descomprime.
 3. Cae a texto plano si no aplica.
 
-Los mensajes descifrados/descomprimidos muestran etiquetas en el chat. El codec
-Dart (`lib/codec/`) es compatible byte a byte con el del firmware, verificado
-con vectores de interoperabilidad en las pruebas.
+Los mensajes descifrados/descomprimidos muestran etiquetas en el chat.
+
+**Producción:** una clave privada no debería distribuirse dentro de la app. Las
+claves de demo viven en `lib/codec/demo_keys.dart` con su advertencia; en
+producción cargá la privada desde un secret store o `--dart-define`. El esquema
+(RSA-2048 OAEP-SHA256, base64) es estándar y se verifica en las pruebas contra un
+vector generado con OpenSSL, equivalente al que produce mbedtls en la placa.
 
 ## Características
 
@@ -79,7 +83,7 @@ con vectores de interoperabilidad en las pruebas.
 - ✅ Escaneo automático de dispositivos LoRa
 - ✅ Conexión BLE con características de notificación
 - ✅ Historial de mensajes en tiempo real por dispositivo
-- ✅ Descifrado RSA y descompresión Huffman en la app (modo seguro)
+- ✅ Descifrado RSA-2048 OAEP y descompresión Huffman en la app (modo seguro)
 - ✅ UI responsive y amigable
 
 ## Estructura
@@ -91,8 +95,9 @@ flutter_app/
 │   ├── main.dart         # App multi-dispositivo (UI + gestión BLE)
 │   └── codec/
 │       ├── huffman_codec.dart  # Huffman (espejo del firmware)
-│       ├── rsa_cipher.dart     # RSA (espejo del firmware)
-│       └── secure_codec.dart   # Pipeline de recepción hex→RSA→Huffman
+│       ├── rsa_oaep.dart       # RSA-2048 OAEP-SHA256 (pointycastle)
+│       ├── demo_keys.dart      # Claves PEM de demostración
+│       └── secure_codec.dart   # Pipeline de recepción base64→RSA→Huffman
 ├── test/                 # Pruebas unitarias (codec, cripto, pipeline, widget)
 └── README.md             # Este archivo
 ```
