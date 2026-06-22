@@ -16,6 +16,7 @@ dependencies:
   pointycastle: ^3.9.1
   basic_utils: ^5.7.0
   shared_preferences: ^2.2.0
+  cryptography: ^2.7.0
 
 dev_dependencies:
   flutter_test:
