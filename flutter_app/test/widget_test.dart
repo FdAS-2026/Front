@@ -1,17 +1,13 @@
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:lora_ble_chat/main.dart';
 
 void main() {
-  testWidgets('Muestra la pantalla inicial de LoRa BLE Chat', (
-    WidgetTester tester,
-  ) async {
+  testWidgets('Arranca en la pantalla de vincular placa', (tester) async {
+    SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const MyApp());
-
-    expect(find.text('LoRa BLE Chat'), findsOneWidget);
-    expect(find.text('Sin conexion'), findsOneWidget);
-    expect(find.text('Escanear'), findsOneWidget);
-    expect(find.byIcon(Icons.bluetooth_searching), findsOneWidget);
+    // Primer frame: sin placa vinculada => pantalla de escaneo/vinculo.
+    expect(find.text('Vincular mi placa'), findsOneWidget);
   });
 }
