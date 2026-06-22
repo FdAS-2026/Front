@@ -44,6 +44,20 @@ void main() {
       final out = utf8.decode(rsa.decryptFromBase64(b64));
       expect(out, 'Mensaje de produccion FdAS');
     });
+
+    test('descifra base64 cifrado por la placa ESP32 fisica (mbedtls)', () {
+      // Vector capturado por serial de la placa real: el firmware cifro
+      // "Mensaje de produccion FdAS" con SecureCrypto (mbedtls, RSA-2048 OAEP).
+      const b64 =
+          'Tu5snN+zoGeJYW/1abYTGGsvqfg1Lv8bGtsoqFee3jlSfbTrf9zpYfwLLatWoVRFAnbW'
+          '4cl0L/VOUJnbdlzEPwubfDKunxwYzNkjO8m4Io8wo+7vRL/jqZTSDl8VlENxRwzbfi+'
+          'vGIAM3TEWqHTc19UMx8ezQu7WogdRZ7yQ7DgscXx0BCMFJk7qgY6wB2f4sIkuIvDD25'
+          'IjzaDmhheTQMXtQdB1a9WSkpMlzqtHsYDvYmQ3j2IViYyfgI1UbYIVrRQMbzT73eyDB'
+          'ugQFfAQUBBMSwISSjypN7i+stt4f5V2JxAu6/8+CG4TeVAnpSDSIrT1s1qZKyzAFtOL'
+          'DET7lg==';
+      final out = utf8.decode(rsa.decryptFromBase64(b64));
+      expect(out, 'Mensaje de produccion FdAS');
+    });
   });
 }
 
