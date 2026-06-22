@@ -136,6 +136,14 @@ class _HomePageState extends State<HomePage> {
         await device.createBond();
       } catch (_) {}
 
+      // Invalida el cache GATT de Android (si la placa cambio de firmware, el
+      // cache viejo ocultaria caracteristicas nuevas).
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        try {
+          await device.clearGattCache();
+        } catch (_) {}
+      }
+
       final services = await device.discoverServices();
       for (final s in services) {
         if (s.uuid.toString().toUpperCase() != serviceUuid.toUpperCase()) continue;
@@ -160,10 +168,10 @@ class _HomePageState extends State<HomePage> {
         board = device;
         connecting = false;
       });
-      // Pedir identidad y contactos.
-      await _send("WHOAMI");
-      await Future.delayed(const Duration(milliseconds: 300));
-      await _send("LIST");
+      // Pedir identidad y contactos (con reintentos por el cifrado BLE).
+      await Future.delayed(const Duration(milliseconds: 800));
+      await _sendRetry("WHOAMI");
+      await _sendRetry("LIST");
     } catch (e) {
       setState(() => connecting = false);
       if (mounted) {
@@ -173,10 +181,24 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _send(String cmd) async {
+  Future<bool> _send(String cmd) async {
     final c = _ctrl;
-    if (c == null) return;
-    await c.write(cmd.codeUnits, withoutResponse: false);
+    if (c == null) return false;
+    try {
+      await c.write(cmd.codeUnits, withoutResponse: false);
+      return true;
+    } catch (_) {
+      return false; // p.ej. cifrado aun no reestablecido tras reconectar
+    }
+  }
+
+  // La 1a escritura a una caracteristica cifrada tras reconectar suele fallar en
+  // Android hasta que se eleva el cifrado; reintentamos.
+  Future<void> _sendRetry(String cmd, {int tries = 5}) async {
+    for (var i = 0; i < tries; i++) {
+      if (await _send(cmd)) return;
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
   }
 
   // ==================== Eventos desde la placa ====================
