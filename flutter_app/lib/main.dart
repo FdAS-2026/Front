@@ -67,6 +67,10 @@ class _HomePageState extends State<HomePage> {
   static const String txUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String ctrlUuid = "6E400004-B5A3-F393-E0A9-E50E24DCCA9E";
 
+  // Maximo de caracteres por mensaje LoRa (deja margen para cabecera + cifrado
+  // AES-GCM + limites de BLE). Mensajes mas largos se parten en varios.
+  static const int maxMsg = 120;
+
   final BoardLinkStore _store = BoardLinkStore();
 
   // Conexion a la placa propia (identidad).
@@ -93,6 +97,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _msgCtrl.addListener(() => setState(() {})); // refrescar contador
     _init();
   }
 
@@ -130,11 +135,14 @@ class _HomePageState extends State<HomePage> {
   Future<void> _connectTo(BluetoothDevice device) async {
     setState(() => connecting = true);
     try {
-      await device.connect(timeout: const Duration(seconds: 15));
-      // Bonding (enlace BLE con passkey en la OLED). Idempotente.
+      // Limpia cualquier bond viejo (de firmwares anteriores) que rompa la
+      // conexion por cifrado desincronizado. Las caracteristicas ya no exigen
+      // cifrado, asi que no hace falta bondear.
       try {
-        await device.createBond();
+        await device.removeBond();
       } catch (_) {}
+
+      await device.connect(timeout: const Duration(seconds: 15));
 
       // Invalida el cache GATT de Android (si la placa cambio de firmware, el
       // cache viejo ocultaria caracteristicas nuevas).
@@ -261,14 +269,20 @@ class _HomePageState extends State<HomePage> {
   }
 
   // ==================== Acciones ====================
-  void _sendMessage(String contactId) {
+  Future<void> _sendMessage(String contactId) async {
     final text = _msgCtrl.text.trim();
     if (text.isEmpty) return;
-    _send("SEND:$contactId:$text");
-    setState(() {
-      chats.putIfAbsent(contactId, () => []).add(ChatMessage(text, true, false));
-    });
     _msgCtrl.clear();
+    // Partir en trozos de maxMsg; cada trozo es un mensaje cifrado aparte.
+    for (var i = 0; i < text.length; i += maxMsg) {
+      final end = (i + maxMsg > text.length) ? text.length : i + maxMsg;
+      final chunk = text.substring(i, end);
+      setState(() {
+        chats.putIfAbsent(contactId, () => []).add(ChatMessage(chunk, true, false));
+      });
+      await _send("SEND:$contactId:$chunk");
+      await Future.delayed(const Duration(milliseconds: 250)); // evitar colisiones LoRa
+    }
   }
 
   void _pairDialog() {
@@ -548,24 +562,46 @@ class _HomePageState extends State<HomePage> {
                     },
                   ),
           ),
-          Container(
-            padding: const EdgeInsets.all(12),
-            color: Colors.white,
-            child: Row(children: [
-              Expanded(
-                child: TextField(
-                  controller: _msgCtrl,
-                  decoration:
-                      const InputDecoration(hintText: "Mensaje cifrado..."),
-                  onSubmitted: (_) => _sendMessage(id),
+          Builder(builder: (_) {
+            final len = _msgCtrl.text.length;
+            final parts = len == 0 ? 0 : ((len - 1) ~/ maxMsg) + 1;
+            final over = len > maxMsg;
+            return Container(
+              padding: const EdgeInsets.all(12),
+              color: Colors.white,
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: Text(
+                    over
+                        ? "$len car. · se enviará en $parts mensajes"
+                        : "$len/$maxMsg",
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: over ? const Color(0xFFB45309) : Colors.grey.shade500,
+                    ),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton(
-                  onPressed: () => _sendMessage(id),
-                  child: const Icon(Icons.send)),
-            ]),
-          ),
+                const SizedBox(height: 4),
+                Row(children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _msgCtrl,
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration:
+                          const InputDecoration(hintText: "Mensaje cifrado..."),
+                      onSubmitted: (_) => _sendMessage(id),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                      onPressed: () => _sendMessage(id),
+                      child: const Icon(Icons.send)),
+                ]),
+              ]),
+            );
+          }),
         ]),
       ),
     );
