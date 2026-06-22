@@ -47,18 +47,39 @@ flutter run
 
 3. **En la app:**
    - Presiona "Escanear" para buscar dispositivos LoRa
-   - Selecciona uno de los dispositivos (LoRA_N1 o LoRA_N2)
-   - Escribe mensajes y presiona "Enviar"
-   - Los mensajes se transmiten por LoRa a la otra placa
-   - Recibes respuestas en tiempo real
+   - Conecta uno o varios nodos (LoRA_N1, LoRA_N2, ...) al mismo tiempo
+   - Usa el botón flotante "Dispositivo" para agregar más sin perder los activos
+   - Cambia de conversación con el selector de chips superior
+   - Escribe mensajes y presiona "Enviar"; van al dispositivo activo
+
+## Multi-dispositivo
+
+La app mantiene **varias conexiones BLE simultáneas**. Cada nodo tiene su propio
+hilo de mensajes y se elige el activo desde el selector superior. El panel de
+estado muestra cuántos dispositivos hay conectados.
+
+## Modo seguro (Huffman + RSA)
+
+Acopla la funcionalidad nueva del firmware en la recepción. Desde el ícono de
+candado en la barra superior se activa el "modo seguro" y se configura la clave
+privada `(d, n)`. Al recibir un mensaje, la app:
+
+1. Si el payload viene en hexadecimal, lo **descifra** con RSA (solo con la
+   clave privada correcta).
+2. Si el resultado es un buffer **Huffman**, lo descomprime.
+3. Cae a texto plano si no aplica.
+
+Los mensajes descifrados/descomprimidos muestran etiquetas en el chat. El codec
+Dart (`lib/codec/`) es compatible byte a byte con el del firmware, verificado
+con vectores de interoperabilidad en las pruebas.
 
 ## Características
 
+- ✅ Múltiples dispositivos LoRa conectados en simultáneo + selector
 - ✅ Escaneo automático de dispositivos LoRa
 - ✅ Conexión BLE con características de notificación
-- ✅ Historial de mensajes en tiempo real
-- ✅ Indicadores visuales de enviado (📤) / recibido (📨)
-- ✅ Desconexión automática con reinicio
+- ✅ Historial de mensajes en tiempo real por dispositivo
+- ✅ Descifrado RSA y descompresión Huffman en la app (modo seguro)
 - ✅ UI responsive y amigable
 
 ## Estructura
@@ -67,8 +88,19 @@ flutter run
 flutter_app/
 ├── pubspec.yaml          # Dependencias
 ├── lib/
-│   └── main.dart         # Código principal (única pantalla)
+│   ├── main.dart         # App multi-dispositivo (UI + gestión BLE)
+│   └── codec/
+│       ├── huffman_codec.dart  # Huffman (espejo del firmware)
+│       ├── rsa_cipher.dart     # RSA (espejo del firmware)
+│       └── secure_codec.dart   # Pipeline de recepción hex→RSA→Huffman
+├── test/                 # Pruebas unitarias (codec, cripto, pipeline, widget)
 └── README.md             # Este archivo
+```
+
+## Pruebas
+
+```bash
+flutter test
 ```
 
 ## Solución de problemas

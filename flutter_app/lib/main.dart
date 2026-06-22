@@ -4,6 +4,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 
+import 'codec/secure_codec.dart';
+
 void main() {
   runApp(const MyApp());
 }
@@ -61,6 +63,57 @@ class MyApp extends StatelessWidget {
   }
 }
 
+String _deviceName(BluetoothDevice device) {
+  final String name = device.platformName;
+  return name.isEmpty ? "Dispositivo sin nombre" : name;
+}
+
+/// Un mensaje del chat con metadatos de origen y de la funcionalidad nueva.
+class ChatMessage {
+  ChatMessage.incoming(this.text, {this.encrypted = false, this.compressed = false})
+      : outgoing = false,
+        system = false,
+        time = DateTime.now();
+  ChatMessage.outgoing(this.text)
+      : outgoing = true,
+        system = false,
+        encrypted = false,
+        compressed = false,
+        time = DateTime.now();
+  ChatMessage.system(this.text)
+      : outgoing = false,
+        system = true,
+        encrypted = false,
+        compressed = false,
+        time = DateTime.now();
+
+  final String text;
+  final bool outgoing;
+  final bool system;
+  final bool encrypted;
+  final bool compressed;
+  final DateTime time;
+
+  String get hhmmss => time.toString().substring(11, 19);
+}
+
+/// Sesion de un dispositivo LoRa conectado por BLE. La app mantiene varias
+/// sesiones activas en simultaneo.
+class DeviceSession {
+  DeviceSession(this.device);
+
+  final BluetoothDevice device;
+  BluetoothCharacteristic? rx;
+  BluetoothCharacteristic? tx;
+  final List<ChatMessage> messages = [];
+  StreamSubscription<List<int>>? notifySub;
+  StreamSubscription<BluetoothConnectionState>? connSub;
+  bool connected = true;
+
+  String get name => _deviceName(device);
+  String get id => device.remoteId.toString();
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -68,26 +121,31 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-String _deviceName(BluetoothDevice device) {
-  final String name = device.platformName;
-  return name.isEmpty ? "Dispositivo sin nombre" : name;
-}
-
 class _HomePageState extends State<HomePage> {
   List<ScanResult> scanResults = [];
   bool isScanning = false;
-  BluetoothDevice? connectedDevice;
-  BluetoothCharacteristic? rxCharacteristic;
-  BluetoothCharacteristic? txCharacteristic;
-  List<String> messages = [];
-  TextEditingController messageController = TextEditingController();
   StreamSubscription? scanSubscription;
-  StreamSubscription? connectionSubscription;
-  StreamSubscription? notificationSubscription;
+
+  final List<DeviceSession> sessions = [];
+  int activeIndex = -1;
+
+  final TextEditingController messageController = TextEditingController();
+
+  // Funcionalidad nueva: descifrado/descompresion en la app.
+  final SecureCodec codec = SecureCodec();
+  bool secureMode = false;
+  // Clave privada de demostracion (igual que secrets.h del firmware).
+  int privD = 1778720129;
+  int privN = 3601800221;
 
   static const String serviceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String rxUuid = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String txUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+
+  DeviceSession? get activeSession =>
+      (activeIndex >= 0 && activeIndex < sessions.length)
+          ? sessions[activeIndex]
+          : null;
 
   @override
   void initState() {
@@ -103,164 +161,300 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  bool _alreadyConnected(BluetoothDevice device) {
+    return sessions.any((s) => s.id == device.remoteId.toString());
+  }
+
   void startScan() {
     setState(() {
       isScanning = true;
       scanResults.clear();
     });
 
+    _bumpScanner();
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
 
     scanSubscription = FlutterBluePlus.scanResults.listen((results) {
       setState(() {
         scanResults = results
             .where((r) => _deviceName(r.device).contains("LoRA_N"))
+            .where((r) => !_alreadyConnected(r.device))
             .toList();
       });
+      _bumpScanner();
     });
 
     Future.delayed(const Duration(seconds: 5), () {
       FlutterBluePlus.stopScan();
-      setState(() {
-        isScanning = false;
-      });
+      if (mounted) {
+        setState(() {
+          isScanning = false;
+        });
+        _bumpScanner();
+      }
     });
   }
 
   Future<void> connectToDevice(BluetoothDevice device) async {
+    if (_alreadyConnected(device)) {
+      _selectByDevice(device);
+      return;
+    }
+
+    final session = DeviceSession(device);
+    setState(() {
+      sessions.add(session);
+      activeIndex = sessions.length - 1;
+      session.messages.add(ChatMessage.system("Conectando a ${session.name}..."));
+    });
+
     try {
       await device.connect();
-      setState(() {
-        connectedDevice = device;
-        messages.clear();
-        messages.add("Sistema: Conectado a ${_deviceName(device)}");
+      _setSession(session, () {
+        session.connected = true;
+        session.messages.add(ChatMessage.system("Conectado a ${session.name}"));
       });
 
-      // Obtener servicios
-      List<BluetoothService> services = await device.discoverServices();
-      for (BluetoothService service in services) {
-        if (service.uuid.toString().toUpperCase() ==
-            serviceUuid.toUpperCase()) {
-          for (BluetoothCharacteristic characteristic
-              in service.characteristics) {
-            if (characteristic.uuid.toString().toUpperCase() ==
-                rxUuid.toUpperCase()) {
-              rxCharacteristic = characteristic;
-            }
-            if (characteristic.uuid.toString().toUpperCase() ==
-                txUuid.toUpperCase()) {
-              txCharacteristic = characteristic;
-              // Escuchar notificaciones
-              await characteristic.setNotifyValue(true);
-              notificationSubscription =
-                  characteristic.onValueReceived.listen((value) {
-                String message = String.fromCharCodes(value);
-                setState(() {
-                  messages.add(
-                    "Recibido ${DateTime.now().toString().substring(11, 19)}: $message",
-                  );
-                });
-              });
-            }
+      final services = await device.discoverServices();
+      for (final service in services) {
+        if (service.uuid.toString().toUpperCase() != serviceUuid.toUpperCase()) {
+          continue;
+        }
+        for (final c in service.characteristics) {
+          final uuid = c.uuid.toString().toUpperCase();
+          if (uuid == rxUuid.toUpperCase()) {
+            session.rx = c;
+          }
+          if (uuid == txUuid.toUpperCase()) {
+            session.tx = c;
+            await c.setNotifyValue(true);
+            session.notifySub = c.onValueReceived.listen((value) {
+              _onIncoming(session, value);
+            });
           }
         }
       }
 
-      // Monitorear desconexion
-      connectionSubscription = device.connectionState.listen((state) {
+      session.connSub = device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
-          setState(() {
-            connectedDevice = null;
-            messages.add("Sistema: Desconectado");
+          _setSession(session, () {
+            session.connected = false;
+            session.messages.add(ChatMessage.system("Desconectado"));
           });
         }
       });
     } catch (e) {
-      setState(() {
-        messages.add("Error: $e");
+      _setSession(session, () {
+        session.messages.add(ChatMessage.system("Error: $e"));
       });
     }
   }
 
+  void _onIncoming(DeviceSession session, List<int> value) {
+    final decoded = codec.decode(
+      value,
+      secure: secureMode,
+      privD: privD,
+      privN: privN,
+    );
+    _setSession(session, () {
+      session.messages.add(ChatMessage.incoming(
+        decoded.text,
+        encrypted: decoded.wasEncrypted,
+        compressed: decoded.wasCompressed,
+      ));
+    });
+  }
+
+  // Aplica cambios en una sesion y refresca solo si sigue montada.
+  void _setSession(DeviceSession session, VoidCallback fn) {
+    if (!mounted) return;
+    setState(fn);
+  }
+
   Future<void> sendMessage(String text) async {
-    if (rxCharacteristic == null) {
+    final session = activeSession;
+    if (session == null) return;
+    if (session.rx == null) {
       setState(() {
-        messages.add("Aviso: Caracteristica RX no encontrada");
+        session.messages.add(ChatMessage.system("Caracteristica RX no encontrada"));
       });
       return;
     }
-
     try {
-      List<int> bytes = text.codeUnits;
-      await rxCharacteristic!.write(bytes);
+      await session.rx!.write(text.codeUnits);
       setState(() {
-        messages.add(
-          "Enviado ${DateTime.now().toString().substring(11, 19)}: $text",
-        );
+        session.messages.add(ChatMessage.outgoing(text));
       });
       messageController.clear();
     } catch (e) {
       setState(() {
-        messages.add("Error al enviar: $e");
+        session.messages.add(ChatMessage.system("Error al enviar: $e"));
       });
     }
   }
 
-  void disconnectDevice() {
-    if (connectedDevice != null) {
-      connectedDevice!.disconnect();
-      setState(() {
-        connectedDevice = null;
-        rxCharacteristic = null;
-        txCharacteristic = null;
-      });
-    }
-    notificationSubscription?.cancel();
-    connectionSubscription?.cancel();
+  void disconnectSession(DeviceSession session) {
+    session.notifySub?.cancel();
+    session.connSub?.cancel();
+    try {
+      session.device.disconnect();
+    } catch (_) {}
+    setState(() {
+      sessions.remove(session);
+      if (activeIndex >= sessions.length) {
+        activeIndex = sessions.length - 1;
+      }
+    });
+  }
+
+  void _selectByDevice(BluetoothDevice device) {
+    final idx = sessions.indexWhere((s) => s.id == device.remoteId.toString());
+    if (idx >= 0) setState(() => activeIndex = idx);
+  }
+
+  void _openScannerSheet() {
+    startScan();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _ScannerSheet(
+        onConnect: (device) {
+          Navigator.of(context).pop();
+          connectToDevice(device);
+        },
+        listenable: _scannerNotifier,
+        stateOf: () => (isScanning, scanResults),
+        onRescan: startScan,
+      ),
+    );
+  }
+
+  // Notificador simple para refrescar la hoja de escaneo.
+  final _scannerNotifier = ValueNotifier<int>(0);
+
+  void _bumpScanner() => _scannerNotifier.value++;
+
+  void _openSettings() {
+    final dCtrl = TextEditingController(text: privD.toString());
+    final nCtrl = TextEditingController(text: privN.toString());
+    showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        bool localSecure = secureMode;
+        return StatefulBuilder(
+          builder: (ctx, setLocal) => AlertDialog(
+            title: const Text("Modo seguro"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text("Descifrar y descomprimir"),
+                  subtitle: const Text(
+                    "Descifra mensajes RSA en hex y descomprime Huffman al recibir.",
+                  ),
+                  value: localSecure,
+                  onChanged: (v) => setLocal(() => localSecure = v),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: dCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: "Clave privada d"),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: nCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: "Modulo n"),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text("Cancelar"),
+              ),
+              FilledButton(
+                onPressed: () {
+                  setState(() {
+                    secureMode = localSecure;
+                    privD = int.tryParse(dCtrl.text) ?? privD;
+                    privN = int.tryParse(nCtrl.text) ?? privN;
+                  });
+                  Navigator.of(ctx).pop();
+                },
+                child: const Text("Guardar"),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   @override
   void dispose() {
     FlutterBluePlus.stopScan();
     scanSubscription?.cancel();
-    notificationSubscription?.cancel();
-    connectionSubscription?.cancel();
+    for (final s in sessions) {
+      s.notifySub?.cancel();
+      s.connSub?.cancel();
+    }
     messageController.dispose();
+    _scannerNotifier.dispose();
     super.dispose();
-  }
-
-  bool _isOutgoingMessage(String message) {
-    return message.startsWith("Enviado");
-  }
-
-  bool _isSystemMessage(String message) {
-    return message.startsWith("Sistema") ||
-        message.startsWith("Aviso") ||
-        message.startsWith("Error");
   }
 
   @override
   Widget build(BuildContext context) {
+    final hasSessions = sessions.isNotEmpty;
+    final active = activeSession;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text("LoRa BLE Chat"),
+        actions: [
+          IconButton(
+            tooltip: secureMode ? "Modo seguro activo" : "Modo seguro",
+            onPressed: _openSettings,
+            icon: Icon(secureMode ? Icons.lock : Icons.lock_open),
+            color: secureMode ? const Color(0xFF16A34A) : null,
+          ),
+        ],
       ),
+      floatingActionButton: hasSessions
+          ? FloatingActionButton.extended(
+              onPressed: _openScannerSheet,
+              icon: const Icon(Icons.add),
+              label: const Text("Dispositivo"),
+            )
+          : null,
       body: SafeArea(
         child: Column(
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
               child: _ConnectionPanel(
-                connectedDevice: connectedDevice,
+                sessionCount: sessions.where((s) => s.connected).length,
+                activeName: active?.name,
                 isScanning: isScanning,
                 onScan: startScan,
-                onDisconnect: disconnectDevice,
               ),
             ),
+            if (hasSessions)
+              _DeviceSelector(
+                sessions: sessions,
+                activeIndex: activeIndex,
+                onSelect: (i) => setState(() => activeIndex = i),
+                onClose: (s) => disconnectSession(s),
+              ),
             Expanded(
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 250),
-                child: connectedDevice == null
+                child: !hasSessions
                     ? _ScannerView(
                         key: const ValueKey("scanner"),
                         isScanning: isScanning,
@@ -269,14 +463,12 @@ class _HomePageState extends State<HomePage> {
                         onScan: startScan,
                       )
                     : _ChatView(
-                        key: const ValueKey("chat"),
-                        messages: messages,
-                        isOutgoingMessage: _isOutgoingMessage,
-                        isSystemMessage: _isSystemMessage,
+                        key: ValueKey("chat-${active?.id}"),
+                        messages: active?.messages ?? const [],
                       ),
               ),
             ),
-            if (connectedDevice != null)
+            if (hasSessions && active != null && active.connected)
               _MessageInput(
                 controller: messageController,
                 onSend: sendMessage,
@@ -290,20 +482,20 @@ class _HomePageState extends State<HomePage> {
 
 class _ConnectionPanel extends StatelessWidget {
   const _ConnectionPanel({
-    required this.connectedDevice,
+    required this.sessionCount,
+    required this.activeName,
     required this.isScanning,
     required this.onScan,
-    required this.onDisconnect,
   });
 
-  final BluetoothDevice? connectedDevice;
+  final int sessionCount;
+  final String? activeName;
   final bool isScanning;
   final VoidCallback onScan;
-  final VoidCallback onDisconnect;
 
   @override
   Widget build(BuildContext context) {
-    final bool isConnected = connectedDevice != null;
+    final bool isConnected = sessionCount > 0;
     final Color accent = isConnected ? const Color(0xFF16A34A) : Colors.orange;
 
     return Container(
@@ -341,7 +533,11 @@ class _ConnectionPanel extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  isConnected ? "Conexion activa" : "Sin conexion",
+                  isConnected
+                      ? (sessionCount == 1
+                          ? "1 dispositivo conectado"
+                          : "$sessionCount dispositivos conectados")
+                      : "Sin conexion",
                   style: const TextStyle(
                     color: Color(0xFF111827),
                     fontWeight: FontWeight.w800,
@@ -351,7 +547,7 @@ class _ConnectionPanel extends StatelessWidget {
                 const SizedBox(height: 4),
                 Text(
                   isConnected
-                      ? _deviceName(connectedDevice!)
+                      ? "Activo: ${activeName ?? '-'}"
                       : isScanning
                           ? "Buscando dispositivos LoRa cercanos"
                           : "Listo para escanear dispositivos BLE",
@@ -366,28 +562,95 @@ class _ConnectionPanel extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 10),
-          isConnected
-              ? FilledButton.tonalIcon(
-                  onPressed: onDisconnect,
-                  icon: const Icon(Icons.link_off, size: 18),
-                  label: const Text("Salir"),
-                  style: FilledButton.styleFrom(
-                    foregroundColor: const Color(0xFFB91C1C),
-                    backgroundColor: const Color(0xFFFEE2E2),
-                  ),
-                )
-              : FilledButton.icon(
-                  onPressed: isScanning ? null : onScan,
-                  icon: isScanning
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.radar, size: 18),
-                  label: Text(isScanning ? "Buscando" : "Escanear"),
-                ),
+          if (!isConnected)
+            FilledButton.icon(
+              onPressed: isScanning ? null : onScan,
+              icon: isScanning
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.radar, size: 18),
+              label: Text(isScanning ? "Buscando" : "Escanear"),
+            ),
         ],
+      ),
+    );
+  }
+}
+
+/// Selector horizontal de los dispositivos conectados (chips).
+class _DeviceSelector extends StatelessWidget {
+  const _DeviceSelector({
+    required this.sessions,
+    required this.activeIndex,
+    required this.onSelect,
+    required this.onClose,
+  });
+
+  final List<DeviceSession> sessions;
+  final int activeIndex;
+  final ValueChanged<int> onSelect;
+  final ValueChanged<DeviceSession> onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 48,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        itemCount: sessions.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final s = sessions[index];
+          final selected = index == activeIndex;
+          final Color base =
+              s.connected ? const Color(0xFF2563EB) : Colors.grey;
+          return GestureDetector(
+            onTap: () => onSelect(index),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              decoration: BoxDecoration(
+                color: selected ? base : Colors.white,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: selected ? base : const Color(0xFFE5E7EB),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    s.connected ? Icons.memory : Icons.link_off,
+                    size: 16,
+                    color: selected ? Colors.white : base,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    s.name,
+                    style: TextStyle(
+                      color: selected ? Colors.white : const Color(0xFF111827),
+                      fontWeight: FontWeight.w700,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: () => onClose(s),
+                    child: Icon(
+                      Icons.close,
+                      size: 15,
+                      color: selected
+                          ? Colors.white70
+                          : Colors.grey.shade500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -499,6 +762,77 @@ class _ScannerView extends StatelessWidget {
   }
 }
 
+/// Hoja inferior para escanear y agregar dispositivos sin perder los activos.
+class _ScannerSheet extends StatelessWidget {
+  const _ScannerSheet({
+    required this.onConnect,
+    required this.listenable,
+    required this.stateOf,
+    required this.onRescan,
+  });
+
+  final ValueChanged<BluetoothDevice> onConnect;
+  final Listenable listenable;
+  final (bool, List<ScanResult>) Function() stateOf;
+  final VoidCallback onRescan;
+
+  @override
+  Widget build(BuildContext context) {
+    return DraggableScrollableSheet(
+      initialChildSize: 0.6,
+      minChildSize: 0.4,
+      maxChildSize: 0.9,
+      expand: false,
+      builder: (context, controller) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: Color(0xFFF6F8FC),
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          padding: const EdgeInsets.only(top: 12),
+          child: AnimatedBuilder(
+            animation: listenable,
+            builder: (context, _) {
+              final (scanning, results) = stateOf();
+              return Column(
+                children: [
+                  Container(
+                    width: 44,
+                    height: 5,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade300,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                  const Padding(
+                    padding: EdgeInsets.all(16),
+                    child: Text(
+                      "Agregar dispositivo",
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                        color: Color(0xFF111827),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: _ScannerView(
+                      isScanning: scanning,
+                      scanResults: results,
+                      onConnect: onConnect,
+                      onScan: onRescan,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
 class _SignalBadge extends StatelessWidget {
   const _SignalBadge({required this.rssi});
 
@@ -539,26 +873,28 @@ class _ChatView extends StatelessWidget {
   const _ChatView({
     super.key,
     required this.messages,
-    required this.isOutgoingMessage,
-    required this.isSystemMessage,
   });
 
-  final List<String> messages;
-  final bool Function(String message) isOutgoingMessage;
-  final bool Function(String message) isSystemMessage;
+  final List<ChatMessage> messages;
 
   @override
   Widget build(BuildContext context) {
+    if (messages.isEmpty) {
+      return const _EmptyState(
+        icon: Icons.forum_outlined,
+        title: "Sin mensajes",
+        subtitle: "Envia un mensaje para iniciar la conversacion con este nodo.",
+      );
+    }
+
     return ListView.builder(
       reverse: true,
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 18),
       itemCount: messages.length,
       itemBuilder: (context, index) {
-        final String message = messages[messages.length - 1 - index];
-        final bool outgoing = isOutgoingMessage(message);
-        final bool system = isSystemMessage(message);
+        final ChatMessage message = messages[messages.length - 1 - index];
 
-        if (system) {
+        if (message.system) {
           return Padding(
             padding: const EdgeInsets.symmetric(vertical: 6),
             child: Center(
@@ -570,7 +906,7 @@ class _ChatView extends StatelessWidget {
                   borderRadius: BorderRadius.circular(999),
                 ),
                 child: Text(
-                  message,
+                  message.text,
                   style: const TextStyle(
                     color: Color(0xFF1E40AF),
                     fontSize: 12,
@@ -581,6 +917,8 @@ class _ChatView extends StatelessWidget {
             ),
           );
         }
+
+        final bool outgoing = message.outgoing;
 
         return Padding(
           padding: const EdgeInsets.symmetric(vertical: 5),
@@ -610,13 +948,36 @@ class _ChatView extends StatelessWidget {
                 child: Padding(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  child: Text(
-                    message,
-                    style: TextStyle(
-                      color: outgoing ? Colors.white : const Color(0xFF172033),
-                      height: 1.35,
-                      fontWeight: FontWeight.w600,
-                    ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        message.text,
+                        style: TextStyle(
+                          color: outgoing
+                              ? Colors.white
+                              : const Color(0xFF172033),
+                          height: 1.35,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (message.encrypted || message.compressed) ...[
+                        const SizedBox(height: 6),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (message.encrypted)
+                              const _Tag(icon: Icons.lock, label: "Descifrado"),
+                            if (message.encrypted && message.compressed)
+                              const SizedBox(width: 6),
+                            if (message.compressed)
+                              const _Tag(
+                                  icon: Icons.compress,
+                                  label: "Descomprimido"),
+                          ],
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),
@@ -624,6 +985,38 @@ class _ChatView extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class _Tag extends StatelessWidget {
+  const _Tag({required this.icon, required this.label});
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: const Color(0xFF16A34A).withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: const Color(0xFF16A34A)),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Color(0xFF16A34A),
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
