@@ -334,6 +334,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _unlinkBoard() async {
+    // Avisar a la placa para que borre su bond y muestre "sin telefono".
+    try {
+      await _send("UNLINK");
+      await Future.delayed(const Duration(milliseconds: 300));
+    } catch (_) {}
     try {
       await board?.removeBond();
     } catch (_) {}
