@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'codec/secure_codec.dart';
 import 'codec/rsa_oaep.dart';
 import 'codec/demo_keys.dart';
+import 'linked_boards_store.dart';
 
 void main() {
   runApp(const MyApp());
@@ -107,10 +108,13 @@ class DeviceSession {
   final BluetoothDevice device;
   BluetoothCharacteristic? rx;
   BluetoothCharacteristic? tx;
+  BluetoothCharacteristic? ctrl;
   final List<ChatMessage> messages = [];
   StreamSubscription<List<int>>? notifySub;
   StreamSubscription<BluetoothConnectionState>? connSub;
   bool connected = true;
+  bool linked = false;   // bonding BLE recordado
+  bool paired = false;   // emparejada con otra placa (LoRa)
 
   String get name => _deviceName(device);
   String get id => device.remoteId.toString();
@@ -148,6 +152,10 @@ class _HomePageState extends State<HomePage> {
   static const String serviceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String rxUuid = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String txUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+  static const String ctrlUuid = "6E400004-B5A3-F393-E0A9-E50E24DCCA9E";
+
+  final LinkedBoardsStore linkedStore = LinkedBoardsStore();
+  Set<String> linkedIds = {};
 
   DeviceSession? get activeSession =>
       (activeIndex >= 0 && activeIndex < sessions.length)
@@ -158,6 +166,13 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     requestPermissions();
+    _loadLinked();
+  }
+
+  Future<void> _loadLinked() async {
+    final boards = await linkedStore.load();
+    if (!mounted) return;
+    setState(() => linkedIds = boards.map((b) => b.id).toSet());
   }
 
   Future<void> requestPermissions() async {
@@ -232,6 +247,9 @@ class _HomePageState extends State<HomePage> {
           if (uuid == rxUuid.toUpperCase()) {
             session.rx = c;
           }
+          if (uuid == ctrlUuid.toUpperCase()) {
+            session.ctrl = c;
+          }
           if (uuid == txUuid.toUpperCase()) {
             session.tx = c;
             await c.setNotifyValue(true);
@@ -241,6 +259,10 @@ class _HomePageState extends State<HomePage> {
           }
         }
       }
+
+      _setSession(session, () {
+        session.linked = linkedIds.contains(session.id);
+      });
 
       session.connSub = device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
@@ -258,6 +280,18 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onIncoming(DeviceSession session, List<int> value) {
+    // Notificacion de estado de emparejamiento desde la placa.
+    final asText = String.fromCharCodes(value);
+    if (asText.startsWith("PAIRED:")) {
+      _setSession(session, () {
+        session.paired = true;
+        session.messages.add(
+          ChatMessage.system("Emparejada con ${asText.substring(7)}"),
+        );
+      });
+      return;
+    }
+
     final decoded = codec.decode(
       value,
       secure: secureMode,
@@ -316,6 +350,116 @@ class _HomePageState extends State<HomePage> {
   void _selectByDevice(BluetoothDevice device) {
     final idx = sessions.indexWhere((s) => s.id == device.remoteId.toString());
     if (idx >= 0) setState(() => activeIndex = idx);
+  }
+
+  Future<void> _sendCtrl(DeviceSession session, String cmd) async {
+    final ctrl = session.ctrl;
+    if (ctrl == null) {
+      setState(() => session.messages
+          .add(ChatMessage.system("Esta placa no acepta comandos de control")));
+      return;
+    }
+    await ctrl.write(cmd.codeUnits);
+  }
+
+  // Enlaza la placa con este telefono (bonding BLE) y la recuerda.
+  Future<void> linkBoard(DeviceSession session) async {
+    try {
+      await session.device.createBond(); // Android: dispara el PIN del sistema
+    } catch (_) {
+      // iOS empareja al acceder a una caracteristica cifrada; se ignora.
+    }
+    await linkedStore.add(session.id, session.name);
+    setState(() {
+      linkedIds.add(session.id);
+      session.linked = true;
+      session.messages.add(ChatMessage.system("Placa enlazada a este telefono"));
+    });
+  }
+
+  // Quita el enlace: avisa a la placa (borra bond), remueve bond local y olvida.
+  Future<void> unlinkBoard(DeviceSession session) async {
+    try {
+      await _sendCtrl(session, "UNLINK");
+    } catch (_) {}
+    try {
+      await session.device.removeBond();
+    } catch (_) {}
+    await linkedStore.remove(session.id);
+    setState(() {
+      linkedIds.remove(session.id);
+      session.linked = false;
+      session.messages.add(ChatMessage.system("Enlace removido"));
+    });
+  }
+
+  // Emparejar dos placas: envia el mismo PIN a todas las placas conectadas.
+  Future<void> _pairBoardsWithPin(String pin) async {
+    final connected = sessions.where((s) => s.connected).toList();
+    for (final s in connected) {
+      await _sendCtrl(s, "PAIR:$pin");
+      _setSession(s, () => s.messages.add(
+            ChatMessage.system("Emparejando con PIN $pin..."),
+          ));
+    }
+  }
+
+  Future<void> unpairBoard(DeviceSession session) async {
+    await _sendCtrl(session, "UNPAIR");
+    setState(() {
+      session.paired = false;
+      session.messages.add(ChatMessage.system("Emparejamiento deshecho"));
+    });
+  }
+
+  void _openPairDialog() {
+    final pinCtrl = TextEditingController();
+    final connectedCount = sessions.where((s) => s.connected).length;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Emparejar placas"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              connectedCount < 2
+                  ? "Conecta las dos placas que quieras emparejar y elige un PIN."
+                  : "Se enviara el PIN a las $connectedCount placas conectadas. "
+                      "Las que compartan el PIN quedaran emparejadas.",
+              style: const TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: pinCtrl,
+              keyboardType: TextInputType.number,
+              maxLength: 8,
+              decoration: const InputDecoration(
+                labelText: "PIN de emparejamiento",
+                hintText: "p. ej. 1234",
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text("Cancelar"),
+          ),
+          FilledButton(
+            onPressed: () {
+              final pin = pinCtrl.text.trim();
+              if (pin.isNotEmpty) {
+                Navigator.of(ctx).pop();
+                _pairBoardsWithPin(pin);
+              }
+            },
+            child: const Text("Emparejar"),
+          ),
+        ],
+      ),
+    );
   }
 
   void _openScannerSheet() {
@@ -429,6 +573,64 @@ class _HomePageState extends State<HomePage> {
             onPressed: _openSettings,
             icon: Icon(secureMode ? Icons.lock : Icons.lock_open),
             color: secureMode ? const Color(0xFF16A34A) : null,
+          ),
+          PopupMenuButton<String>(
+            tooltip: "Enlace y emparejamiento",
+            icon: const Icon(Icons.link),
+            onSelected: (value) {
+              switch (value) {
+                case 'pair':
+                  _openPairDialog();
+                  break;
+                case 'link':
+                  if (active != null) linkBoard(active);
+                  break;
+                case 'unlink':
+                  if (active != null) unlinkBoard(active);
+                  break;
+                case 'unpair':
+                  if (active != null) unpairBoard(active);
+                  break;
+              }
+            },
+            itemBuilder: (ctx) => [
+              const PopupMenuItem(
+                value: 'pair',
+                child: ListTile(
+                  leading: Icon(Icons.cable),
+                  title: Text("Emparejar placas (PIN)"),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              if (active != null) const PopupMenuDivider(),
+              if (active != null && !active.linked)
+                const PopupMenuItem(
+                  value: 'link',
+                  child: ListTile(
+                    leading: Icon(Icons.add_link),
+                    title: Text("Enlazar placa activa"),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              if (active != null && active.linked)
+                const PopupMenuItem(
+                  value: 'unlink',
+                  child: ListTile(
+                    leading: Icon(Icons.link_off),
+                    title: Text("Desenlazar placa activa"),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              if (active != null && active.paired)
+                const PopupMenuItem(
+                  value: 'unpair',
+                  child: ListTile(
+                    leading: Icon(Icons.cancel),
+                    title: Text("Desemparejar placa activa"),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+            ],
           ),
         ],
       ),
@@ -642,6 +844,18 @@ class _DeviceSelector extends StatelessWidget {
                       fontSize: 13,
                     ),
                   ),
+                  if (s.linked) ...[
+                    const SizedBox(width: 4),
+                    Icon(Icons.lock,
+                        size: 13,
+                        color: selected ? Colors.white : const Color(0xFF16A34A)),
+                  ],
+                  if (s.paired) ...[
+                    const SizedBox(width: 2),
+                    Icon(Icons.cable,
+                        size: 13,
+                        color: selected ? Colors.white : const Color(0xFF2563EB)),
+                  ],
                   const SizedBox(width: 6),
                   GestureDetector(
                     onTap: () => onClose(s),

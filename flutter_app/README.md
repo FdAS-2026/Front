@@ -58,6 +58,23 @@ La app mantiene **varias conexiones BLE simultáneas**. Cada nodo tiene su propi
 hilo de mensajes y se elige el activo desde el selector superior. El panel de
 estado muestra cuántos dispositivos hay conectados.
 
+## Enlace y emparejamiento
+
+Desde el ícono de cadena (🔗) en la barra superior:
+
+- **Enlazar placa activa:** crea el bonding BLE (`createBond`). La placa muestra
+  un PIN de 6 dígitos en su OLED y el sistema lo pide en el teléfono. La placa
+  enlazada se recuerda entre sesiones (`shared_preferences`).
+- **Desenlazar placa activa:** envía `UNLINK`, quita el bond (`removeBond`) y la
+  olvida.
+- **Emparejar placas (PIN):** ingresás un PIN y la app envía `PAIR:<pin>` a todas
+  las placas conectadas; las que compartan el PIN quedan emparejadas entre sí por
+  LoRa. La placa avisa con `PAIRED:Nx`.
+- **Desemparejar placa activa:** envía `UNPAIR`.
+
+Los chips del selector muestran 🔒 (enlazada) y 🔌 (emparejada). El modelo de
+persistencia (`LinkedBoardsStore`) está cubierto por pruebas.
+
 ## Modo seguro (RSA-2048 + Huffman)
 
 Acopla la funcionalidad del firmware en la recepción. Desde el ícono de candado
