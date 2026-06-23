@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 
 import 'board_link_store.dart';
+import 'codec/chunking.dart';
 
 void main() {
   runApp(const MyApp());
@@ -46,13 +48,79 @@ class MyApp extends StatelessWidget {
   }
 }
 
+enum MsgStatus { sending, delivered, failed }
+
+enum MsgMedium { lora, broker, none }
+
 /// Un mensaje del chat con un contacto.
+///
+/// Modela N partes (chunks) de un mismo mensaje de usuario. Para mensajes cortos
+/// (una sola parte) se comporta igual que antes: lista de 1 elemento.
 class ChatMessage {
-  ChatMessage(this.text, this.outgoing, this.system) : time = DateTime.now();
+  ChatMessage(this.text, this.outgoing, this.system,
+      {String? msgId,
+      this.status = MsgStatus.sending,
+      this.medium = MsgMedium.none,
+      List<String?>? partIds})
+      : partMsgIds = partIds ?? [msgId],
+        partStatuses = List.filled((partIds ?? [msgId]).length, MsgStatus.sending),
+        partMediums = List.filled((partIds ?? [msgId]).length, MsgMedium.none),
+        time = DateTime.now();
+
   final String text;
   final bool outgoing;
   final bool system;
   final DateTime time;
+
+  // Listas mutables de partes: un slot por chunk del mensaje.
+  final List<String?> partMsgIds;
+  final List<MsgStatus> partStatuses;
+  final List<MsgMedium> partMediums;
+
+  // Campos mutables singulares: compatibilidad con codigo existente.
+  // 04-03 los reemplazara por los getters agregados.
+  MsgStatus status;
+  MsgMedium medium;
+
+  /// Compatibilidad retroactiva: apunta al primer slot de [partMsgIds].
+  String? get msgId => partMsgIds.first;
+  set msgId(String? v) => partMsgIds[0] = v;
+
+  /// Asigna [id] al primer slot null de [partMsgIds].
+  /// Devuelve true si habia un slot libre, false si todos ya tienen id.
+  bool assignNextMsgId(String id) {
+    final i = partMsgIds.indexOf(null);
+    if (i < 0) return false;
+    partMsgIds[i] = id;
+    return true;
+  }
+
+  /// True si alguna parte tiene exactamente este [id].
+  bool hasMsgId(String id) => partMsgIds.contains(id);
+
+  /// Estado agregado del mensaje completo.
+  /// - todas delivered → delivered
+  /// - alguna failed → failed (precede a delivered)
+  /// - resto → sending
+  MsgStatus get aggregateStatus {
+    if (partStatuses.every((s) => s == MsgStatus.delivered)) {
+      return MsgStatus.delivered;
+    }
+    if (partStatuses.any((s) => s == MsgStatus.failed)) {
+      return MsgStatus.failed;
+    }
+    return MsgStatus.sending;
+  }
+
+  /// Medio agregado del mensaje completo.
+  /// - alguna broker → broker
+  /// - todas lora → lora
+  /// - con partes pendientes → none
+  MsgMedium get aggregateMedium {
+    if (partMediums.any((m) => m == MsgMedium.broker)) return MsgMedium.broker;
+    if (partMediums.every((m) => m == MsgMedium.lora)) return MsgMedium.lora;
+    return MsgMedium.none;
+  }
 }
 
 class HomePage extends StatefulWidget {
@@ -66,10 +134,6 @@ class _HomePageState extends State<HomePage> {
   static const String serviceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String txUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
   static const String ctrlUuid = "6E400004-B5A3-F393-E0A9-E50E24DCCA9E";
-
-  // Maximo de caracteres por mensaje LoRa (deja margen para cabecera + cifrado
-  // AES-GCM + limites de BLE). Mensajes mas largos se parten en varios.
-  static const int maxMsg = 120;
 
   final BoardLinkStore _store = BoardLinkStore();
 
@@ -87,6 +151,9 @@ class _HomePageState extends State<HomePage> {
   String myId = "";
   String myName = "";
 
+  // Estado WiFi de la placa (recibido via evento WIFI:<estado>).
+  String wifiState = "";
+
   // Contactos: id -> nombre. Mensajes por contacto.
   final Map<String, String> contacts = {};
   final Map<String, List<ChatMessage>> chats = {};
@@ -94,11 +161,26 @@ class _HomePageState extends State<HomePage> {
 
   final TextEditingController _msgCtrl = TextEditingController();
 
+  // Contador de grupos para mensajes multi-parte (0 para mensajes de 1 parte).
+  int _grpCounter = 0;
+
+  // Buffer de reensamblado de partes entrantes: clave = "$src:$grp".
+  // Cap de 16 grupos activos; grupos incompletos expiran a los 60 s (purga cada 30 s).
+  final Map<String, PartGroup> _reassembly = {};
+
+  // Timer de purga del buffer de reensamblado.
+  Timer? _purgeTimer;
+
   @override
   void initState() {
     super.initState();
     _msgCtrl.addListener(() => setState(() {})); // refrescar contador
     _init();
+    // Purgar grupos de reensamblado incompletos cada 30 s (timeout de 60 s por grupo).
+    _purgeTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _purgeExpiredGroups(),
+    );
   }
 
   Future<void> _init() async {
@@ -115,6 +197,7 @@ class _HomePageState extends State<HomePage> {
 
   // ==================== Escaneo / vinculo ====================
   void startScan() {
+    _scanSub?.cancel();  // cancelar suscripcion anterior para evitar listeners zombie
     setState(() {
       isScanning = true;
       scanResults = [];
@@ -193,7 +276,7 @@ class _HomePageState extends State<HomePage> {
     final c = _ctrl;
     if (c == null) return false;
     try {
-      await c.write(cmd.codeUnits, withoutResponse: false);
+      await c.write(utf8.encode(cmd), withoutResponse: false);
       return true;
     } catch (_) {
       return false; // p.ej. cifrado aun no reestablecido tras reconectar
@@ -209,9 +292,22 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  // ==================== Helpers de estado por mensaje ====================
+
+  /// Busca en todos los chats la primera burbuja outgoing que contiene [id]
+  /// en alguna de sus partes ([hasMsgId]).
+  ChatMessage? _findByMsgId(String id) {
+    for (final msgs in chats.values) {
+      for (final m in msgs) {
+        if (m.outgoing && m.hasMsgId(id)) return m;
+      }
+    }
+    return null;
+  }
+
   // ==================== Eventos desde la placa ====================
   void _onEvent(List<int> value) {
-    final msg = String.fromCharCodes(value);
+    final msg = utf8.decode(value, allowMalformed: true);
     final i = msg.indexOf(':');
     final tag = i < 0 ? msg : msg.substring(0, i);
     final rest = i < 0 ? "" : msg.substring(i + 1);
@@ -253,16 +349,126 @@ class _HomePageState extends State<HomePage> {
         final j = rest.indexOf(':');
         if (j > 0) {
           final src = rest.substring(0, j);
-          final text = rest.substring(j + 1);
-          setState(() {
-            chats.putIfAbsent(src, () => []).add(ChatMessage(text, false, false));
-          });
+          final payloadStr = rest.substring(j + 1);
+          // Reconstruir bytes para detectar el header de parte (0x01...0x02).
+          // 0x01 y 0x02 son ASCII valido: round-trip utf8 decode/encode es sin perdida.
+          final payloadBytes = utf8.encode(payloadStr);
+          _handleIncoming(src, payloadBytes);
         }
         break;
       case "ERR":
         if (mounted) {
           ScaffoldMessenger.of(context)
               .showSnackBar(SnackBar(content: Text("Placa: $rest")));
+        }
+        break;
+      case "WIFI":
+        setState(() => wifiState = rest);
+        break;
+
+      // ── Feedback de entrega por mensaje ──────────────────────────────────
+      case "SENT":
+        // rest = "<msgIdHex>:<dstHex>"
+        // Asigna el msgId al primer slot libre de la burbuja outgoing mas antigua (FIFO).
+        // Con mensajes multi-parte, cada SENT llena el proximo slot null de la burbuja
+        // correcta via assignNextMsgId, manteniendo el orden en que se enviaron los chunks.
+        final sentParts = rest.split(':');
+        if (sentParts.length >= 2) {
+          final sentMsgId = sentParts[0].toUpperCase();
+          final sentDst = sentParts[1].toUpperCase();
+          setState(() {
+            final msgs = chats[sentDst];
+            if (msgs != null) {
+              // Forward scan: asignar al primer slot libre de la primera burbuja outgoing
+              // que todavia tenga partes pendientes (FIFO por destino).
+              for (var k = 0; k < msgs.length; k++) {
+                if (msgs[k].outgoing && msgs[k].assignNextMsgId(sentMsgId)) {
+                  break;
+                }
+              }
+            }
+          });
+        }
+        break;
+
+      case "ACK":
+        // rest = "<msgIdHex>:<medio>" — medio es "lora" o "broker"
+        final ackParts = rest.split(':');
+        if (ackParts.length >= 2) {
+          final ackId = ackParts[0].toUpperCase();
+          final medio = ackParts[1].toLowerCase();
+          setState(() {
+            final m = _findByMsgId(ackId);
+            if (m != null) {
+              // Marcar la parte especifica como delivered con su medio.
+              final idx = m.partMsgIds.indexOf(ackId);
+              if (idx >= 0) {
+                m.partStatuses[idx] = MsgStatus.delivered;
+                m.partMediums[idx] =
+                    (medio == 'broker') ? MsgMedium.broker : MsgMedium.lora;
+              }
+              // Recalcular el estado/medio agregado de la burbuja completa.
+              m.status = m.aggregateStatus;
+              m.medium = m.aggregateMedium;
+            }
+          });
+        }
+        break;
+
+      case "NACK":
+        // rest = "<msgIdHex>"
+        if (rest.isNotEmpty) {
+          setState(() {
+            final nackId = rest.toUpperCase();
+            final m = _findByMsgId(nackId);
+            if (m != null) {
+              final idx = m.partMsgIds.indexOf(nackId);
+              if (idx >= 0) m.partStatuses[idx] = MsgStatus.failed;
+              m.status = m.aggregateStatus;
+              m.medium = m.aggregateMedium;
+            }
+          });
+        }
+        break;
+
+      case "FAIL":
+        // rest = "<msgIdHex>"
+        if (rest.isNotEmpty) {
+          setState(() {
+            final failId = rest.toUpperCase();
+            final m = _findByMsgId(failId);
+            if (m != null) {
+              final idx = m.partMsgIds.indexOf(failId);
+              if (idx >= 0) m.partStatuses[idx] = MsgStatus.failed;
+              m.status = m.aggregateStatus;
+              m.medium = m.aggregateMedium;
+            }
+          });
+        }
+        break;
+
+      case "NEEDNET":
+        // rest = "<msgIdHex>" — el fallback requiere hotspot pero la placa no tiene WiFi.
+        if (rest.isNotEmpty) {
+          setState(() {
+            final needId = rest.toUpperCase();
+            final m = _findByMsgId(needId);
+            if (m != null) {
+              final idx = m.partMsgIds.indexOf(needId);
+              if (idx >= 0) m.partStatuses[idx] = MsgStatus.failed;
+              m.status = m.aggregateStatus;
+              m.medium = m.aggregateMedium;
+            }
+          });
+        }
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                  "Prende el hotspot del teléfono para entregar por broker"),
+              duration: Duration(seconds: 5),
+            ),
+          );
         }
         break;
     }
@@ -273,16 +479,97 @@ class _HomePageState extends State<HomePage> {
     final text = _msgCtrl.text.trim();
     if (text.isEmpty) return;
     _msgCtrl.clear();
-    // Partir en trozos de maxMsg; cada trozo es un mensaje cifrado aparte.
-    for (var i = 0; i < text.length; i += maxMsg) {
-      final end = (i + maxMsg > text.length) ? text.length : i + maxMsg;
-      final chunk = text.substring(i, end);
-      setState(() {
-        chats.putIfAbsent(contactId, () => []).add(ChatMessage(chunk, true, false));
-      });
-      await _send("SEND:$contactId:$chunk");
+
+    // Partir en chunks byte-aware; cada uno cabe en BLE MTU, buffer del firmware y LoRa.
+    final chunks = Chunking.splitUtf8(text, Chunking.maxBytes);
+    final n = chunks.length;
+
+    // grp=0 para mensajes de 1 parte (backward compatible).
+    // Multi-parte recibe un grp unico incremental (mod 65536) para que el receptor
+    // pueda distinguir grupos de diferentes mensajes del mismo emisor.
+    final grp = n > 1 ? (_grpCounter = (_grpCounter + 1) % 65536) : 0;
+
+    // UNA sola burbuja logica con N slots: se muestra el texto completo de inmediato
+    // y el estado/medio se actualiza a medida que llegan los SENT/ACK/NACK/FAIL.
+    setState(() {
+      chats.putIfAbsent(contactId, () => []).add(
+        ChatMessage(text, true, false, partIds: List.filled(n, null)),
+      );
+    });
+
+    // Enviar cada chunk con su header de parte y delay anti-colision LoRa.
+    for (var i = 0; i < n; i++) {
+      final payload = Chunking.buildChunkPayload(grp, i, n, chunks[i]);
+      final chunkStr = Chunking.decodeChunk(payload);
+      await _send('SEND:$contactId:$chunkStr');
       await Future.delayed(const Duration(milliseconds: 250)); // evitar colisiones LoRa
     }
+  }
+
+  // ==================== Reensamblado de mensajes entrantes ====================
+
+  /// Procesa un mensaje entrante con posible header de parte (mensajes multi-parte).
+  ///
+  /// Si [payloadBytes] NO tiene header (n==1 o header malformado): decodifica y
+  /// muestra directo — camino backward-compatible con mensajes cortos.
+  /// Si tiene header: bufferea la parte en [_reassembly] y muestra UNA burbuja solo
+  /// cuando llegan las n partes del grupo (completado en orden de llegada).
+  void _handleIncoming(String src, List<int> payloadBytes) {
+    final header = Chunking.parsePartHeader(payloadBytes);
+
+    if (header == null) {
+      // Mensaje de 1 parte o header malformado: mostrar directo (backward compatible).
+      final text = Chunking.decodeChunk(payloadBytes);
+      setState(() {
+        chats.putIfAbsent(src, () => []).add(ChatMessage(text, false, false));
+      });
+      return;
+    }
+
+    // Mensaje multi-parte: bufferar por (src, grp).
+    final key = '$src:${header.grp}';
+
+    // Cap de 16 grupos activos para acotar memoria (T-04-02: DoS prevention).
+    // Al exceder el cap, descartar el grupo mas antiguo.
+    if (!_reassembly.containsKey(key) && _reassembly.length >= 16) {
+      String? oldestKey;
+      DateTime? oldestTime;
+      _reassembly.forEach((k, v) {
+        if (oldestTime == null || v.created.isBefore(oldestTime!)) {
+          oldestKey = k;
+          oldestTime = v.created;
+        }
+      });
+      if (oldestKey != null) _reassembly.remove(oldestKey);
+    }
+
+    final group = _reassembly.putIfAbsent(key, () => PartGroup(header.n));
+    // Descartar partes cuyo n no coincide con el grupo ya creado (protocolo corrupto).
+    if (group.n != header.n) {
+      debugPrint('chunking: n inconsistente en grupo $key: '
+          'esperado ${group.n}, recibido ${header.n}; parte descartada');
+      return;
+    }
+    group.addPart(header.i, header.textBytes);
+
+    if (group.isComplete) {
+      final text = group.assemble();
+      _reassembly.remove(key);
+      setState(() {
+        chats.putIfAbsent(src, () => []).add(ChatMessage(text, false, false));
+      });
+    }
+  }
+
+  /// Elimina grupos de reensamblado incompletos con mas de 60 segundos de antiguedad.
+  ///
+  /// Llamado periodicamente por [_purgeTimer] cada 30 s.
+  /// Previene leak de memoria por mensajes multi-parte que nunca se completaron.
+  void _purgeExpiredGroups() {
+    final now = DateTime.now();
+    _reassembly.removeWhere(
+      (_, group) => now.difference(group.created).inSeconds > 60,
+    );
   }
 
   void _pairDialog() {
@@ -347,6 +634,49 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  void _wifiDialog() {
+    final ssidCtrl = TextEditingController();
+    final passCtrl = TextEditingController();
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Configurar WiFi"),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(
+              controller: ssidCtrl,
+              decoration: const InputDecoration(labelText: "SSID (nombre de red)")),
+          const SizedBox(height: 12),
+          TextField(
+              controller: passCtrl,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: "Contraseña")),
+        ]),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text("Cancelar")),
+          FilledButton(
+              onPressed: () {
+                final ssid = ssidCtrl.text.trim();
+                if (ssid.isEmpty) {
+                  Navigator.pop(ctx);
+                  return;
+                }
+                if (ssid.contains(':')) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('El nombre de red no puede contener ":"'),
+                  ));
+                  return;
+                }
+                // NO se hace trim de la pass: puede contener espacios o ':' validos.
+                _send("SETWIFI:$ssid:${passCtrl.text}");
+                Navigator.pop(ctx);
+              },
+              child: const Text("Guardar")),
+        ],
+      ),
+    );
+  }
+
   Future<void> _unlinkBoard() async {
     // Avisar a la placa para que borre su bond y muestre "sin telefono".
     try {
@@ -371,6 +701,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _purgeTimer?.cancel();
     _notifySub?.cancel();
     _connSub?.cancel();
     _scanSub?.cancel();
@@ -454,14 +785,19 @@ class _HomePageState extends State<HomePage> {
                 style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
         ]),
         actions: [
+          _WifiBadge(wifiState: wifiState),
           PopupMenuButton<String>(
             onSelected: (v) {
               if (v == 'rename') _renameDialog();
               if (v == 'unlink') _unlinkBoard();
               if (v == 'refresh') _send("LIST");
+              if (v == 'wifi') _wifiDialog();
+              if (v == 'clearwifi') _send("CLEARWIFI");
             },
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'rename', child: Text("Renombrar mi placa")),
+              PopupMenuItem(value: 'wifi', child: Text("Configurar WiFi")),
+              PopupMenuItem(value: 'clearwifi', child: Text("Borrar WiFi")),
               PopupMenuItem(value: 'refresh', child: Text("Actualizar contactos")),
               PopupMenuItem(value: 'unlink', child: Text("Desvincular placa")),
             ],
@@ -552,20 +888,35 @@ class _HomePageState extends State<HomePage> {
                                 : Colors.white,
                             borderRadius: BorderRadius.circular(16),
                           ),
-                          child: Text(m.text,
-                              style: TextStyle(
-                                  color: m.outgoing
-                                      ? Colors.white
-                                      : const Color(0xFF172033))),
+                          child: m.outgoing
+                              ? Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    Flexible(
+                                      child: Text(m.text,
+                                          style: const TextStyle(
+                                              color: Colors.white)),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _StatusIcon(
+                                        status: m.status, medium: m.medium),
+                                  ],
+                                )
+                              : Text(m.text,
+                                  style: const TextStyle(
+                                      color: Color(0xFF172033))),
                         ),
                       );
                     },
                   ),
           ),
           Builder(builder: (_) {
-            final len = _msgCtrl.text.length;
-            final parts = len == 0 ? 0 : ((len - 1) ~/ maxMsg) + 1;
-            final over = len > maxMsg;
+            final len = utf8.encode(_msgCtrl.text).length;
+            final parts = _msgCtrl.text.isEmpty
+                ? 0
+                : Chunking.splitUtf8(_msgCtrl.text, Chunking.maxBytes).length;
+            final over = len > Chunking.maxBytes;
             return Container(
               padding: const EdgeInsets.all(12),
               color: Colors.white,
@@ -575,7 +926,7 @@ class _HomePageState extends State<HomePage> {
                   child: Text(
                     over
                         ? "$len car. · se enviará en $parts mensajes"
-                        : "$len/$maxMsg",
+                        : "$len/${Chunking.maxBytes}",
                     style: TextStyle(
                       fontSize: 11,
                       color: over ? const Color(0xFFB45309) : Colors.grey.shade500,
@@ -603,6 +954,82 @@ class _HomePageState extends State<HomePage> {
             );
           }),
         ]),
+      ),
+    );
+  }
+}
+
+/// Ícono de estado de entrega para burbujas salientes.
+/// Sigue el mismo patrón de mapeo estado→icono+color que [_WifiBadge].
+class _StatusIcon extends StatelessWidget {
+  const _StatusIcon({required this.status, required this.medium});
+  final MsgStatus status;
+  final MsgMedium medium;
+
+  @override
+  Widget build(BuildContext context) {
+    final IconData icon;
+    final Color color;
+
+    switch (status) {
+      case MsgStatus.sending:
+        icon = Icons.schedule;
+        color = Colors.white54;
+        break;
+      case MsgStatus.delivered:
+        icon = medium == MsgMedium.broker ? Icons.cloud_done : Icons.check;
+        color = Colors.white;
+        break;
+      case MsgStatus.failed:
+        icon = Icons.error_outline;
+        color = const Color(0xFFFFCDD2); // rojo claro sobre fondo azul
+        break;
+    }
+
+    return Icon(icon, size: 14, color: color);
+  }
+}
+
+/// Badge compacto del estado WiFi de la placa, mostrado en el AppBar.
+/// Mapea los codigos del firmware a icono + tooltip legibles.
+class _WifiBadge extends StatelessWidget {
+  const _WifiBadge({required this.wifiState});
+  final String wifiState;
+
+  @override
+  Widget build(BuildContext context) {
+    final IconData icon;
+    final Color color;
+    final String tooltip;
+
+    switch (wifiState) {
+      case "conectado":
+        icon = Icons.wifi;
+        color = const Color(0xFF2563EB);
+        tooltip = "WiFi conectado";
+        break;
+      case "sin_red":
+        icon = Icons.wifi_off;
+        color = const Color(0xFFDC2626); // rojo
+        tooltip = "Sin red WiFi";
+        break;
+      case "SET":
+        icon = Icons.wifi_find;
+        color = const Color(0xFFD97706); // ambar — transitorio
+        tooltip = "Conectando...";
+        break;
+      case "sin_cred":
+      default:
+        icon = Icons.wifi_find;
+        color = Colors.grey;
+        tooltip = wifiState.isEmpty ? "WiFi sin configurar" : "WiFi: $wifiState";
+    }
+
+    return Tooltip(
+      message: tooltip,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Icon(icon, color: color, size: 22),
       ),
     );
   }
