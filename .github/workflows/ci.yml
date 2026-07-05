@@ -1,0 +1,36 @@
+name: CI
+
+# Gate verde de la app: corre en cada push a dev/main y en PRs a main.
+# Debe pasar antes de mergear a main.
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  app:
+    name: Analyze + tests Flutter
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flutter_app
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pineado a la version usada en desarrollo (3.44.2) para que el analyze
+      # y los tests den identico a local.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+          cache: true
+
+      - name: Dependencias
+        run: flutter pub get
+
+      - name: Analyze (sin issues)
+        run: flutter analyze
+
+      - name: Tests
+        run: flutter test
