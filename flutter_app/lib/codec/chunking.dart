@@ -3,8 +3,8 @@ import 'dart:convert';
 /// Logica pura de fragmentacion y reensamblado de mensajes UTF-8 byte-aware.
 ///
 /// Sin dependencias de Flutter ni BLE: testeable con `flutter test` sin hardware.
-/// Patron identico a [E2ECrypto]: solo metodos static sobre una clase sellada
-/// y una clase auxiliar [PartGroup] sin estado de instancia global.
+/// Solo metodos static sobre una clase sellada y una clase auxiliar [PartGroup]
+/// sin estado de instancia global.
 ///
 /// Bytes de control elegidos:
 ///   [kPartStart] = 0x01 (ASCII STX)
